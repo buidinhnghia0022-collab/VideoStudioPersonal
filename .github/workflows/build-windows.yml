@@ -4,11 +4,6 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
-    paths:
-      - 'app.py'
-      - 'requirements.txt'
-      - 'installer.iss'
-      - '.github/workflows/build-windows.yml'
 
 permissions:
   contents: read
@@ -17,15 +12,11 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
-
       - name: Install dependencies
         shell: pwsh
         run: |
@@ -34,7 +25,6 @@ jobs:
           pip install pyinstaller==6.16.0
           choco install ffmpeg-shared --no-progress -y
           choco install innosetup --no-progress -y
-
       - name: Locate FFmpeg
         id: media
         shell: pwsh
@@ -43,22 +33,17 @@ jobs:
           $ffprobe=(Get-Command ffprobe.exe).Source
           "ffmpeg=$ffmpeg" >> $env:GITHUB_OUTPUT
           "ffprobe=$ffprobe" >> $env:GITHUB_OUTPUT
-          & $ffmpeg -version | Select-Object -First 1
-
-      - name: Build application with media tools
+      - name: Build application
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --windowed --name VideoStudioPersonal --collect-all yt_dlp --add-binary "${{ steps.media.outputs.ffmpeg }};." --add-binary "${{ steps.media.outputs.ffprobe }};." app.py
+          pyinstaller --noconfirm --clean --windowed --name VideoStudioPersonal --collect-all yt_dlp --collect-all faster_whisper --collect-all ctranslate2 --add-binary "${{ steps.media.outputs.ffmpeg }};." --add-binary "${{ steps.media.outputs.ffprobe }};." app.py
           if (!(Test-Path 'dist/VideoStudioPersonal/VideoStudioPersonal.exe')) { throw 'EXE build failed' }
-
       - name: Build installer
         shell: pwsh
         run: |
           & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer.iss
           if (!(Test-Path 'installer/VideoStudioPersonal_Setup.exe')) { throw 'Installer build failed' }
-
-      - name: Upload installer
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: VideoStudioPersonal-Windows-Installer
           path: installer/VideoStudioPersonal_Setup.exe
