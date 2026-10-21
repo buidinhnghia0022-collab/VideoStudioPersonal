@@ -1,92 +1,93 @@
-import sys, json, shutil, subprocess, logging
+import sys, json, logging, traceback
 from datetime import datetime
 from pathlib import Path
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QFileDialog,QTreeWidget,QTreeWidgetItem,QProgressBar,QMessageBox,QTextEdit,QGroupBox,QHeaderView)
+from PySide6.QtCore import Qt,QThread,Signal
+from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLabel,QPushButton,QFileDialog,QTreeWidget,QTreeWidgetItem,QProgressBar,QMessageBox,QTextEdit,QGroupBox,QHeaderView,QLineEdit,QComboBox,QDoubleSpinBox)
+from engine import BASE,probe,download_video,extract_audio,write_srt,render_subtitles,make_project,bundled,run
+from ai_pipeline import transcribe_whisper,translate_segments,save_segments,ollama_available
 
-APP_NAME='Video Studio Personal'
-VERSION='0.2.0'
-BASE=Path.home()/'VideoStudioPersonal'
-for d in ('projects','output','logs','cache','models','tools'):
-    (BASE/d).mkdir(parents=True,exist_ok=True)
+APP_NAME='Video Studio Personal'; VERSION='0.4.0'
+for d in ('projects','output','logs','cache','models','tools','downloads'):(BASE/d).mkdir(parents=True,exist_ok=True)
 LOG=BASE/'logs'/f"studio-{datetime.now():%Y%m%d}.log"
 logging.basicConfig(filename=LOG,level=logging.INFO,encoding='utf-8',format='%(asctime)s | %(levelname)s | %(message)s')
 
-def run(cmd,timeout=15):
-    try:
-        p=subprocess.run(cmd,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=timeout,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-        return p.returncode,p.stdout.strip(),p.stderr.strip()
-    except Exception as e: return -1,'',str(e)
-
-def find_tool(name):
-    local=BASE/'tools'/(name+'.exe')
-    return str(local) if local.exists() else shutil.which(name)
-
-def probe(path):
-    ffprobe=find_tool('ffprobe')
-    if not ffprobe: return {'error':'Chưa tìm thấy ffprobe. FFmpeg sẽ được tích hợp ở build tiếp theo.'}
-    rc,out,err=run([ffprobe,'-v','quiet','-print_format','json','-show_format','-show_streams',path],30)
-    if rc: return {'error':err or 'Không đọc được video'}
-    try:
-        data=json.loads(out); v=next((s for s in data.get('streams',[]) if s.get('codec_type')=='video'),{})
-        dur=float(data.get('format',{}).get('duration',0) or 0); fps=v.get('avg_frame_rate','0/1')
-        try:
-            a,b=fps.split('/'); fps=f'{float(a)/float(b):.2f}' if float(b) else '0'
-        except: pass
-        return {'duration':dur,'resolution':f"{v.get('width','?')}×{v.get('height','?')}",'fps':fps,'codec':v.get('codec_name','?')}
-    except Exception as e: return {'error':str(e)}
-
-def duration_text(sec):
+def dt(sec):
     sec=int(sec or 0); return f'{sec//3600:02d}:{(sec%3600)//60:02d}:{sec%60:02d}'
+
+class Worker(QThread):
+    message=Signal(str); progress=Signal(int); done=Signal(str); failed=Signal(str)
+    def __init__(self,mode,payload): super().__init__(); self.mode=mode; self.payload=payload
+    def run(self):
+        try:
+            if self.mode=='download':
+                p=download_video(self.payload,BASE/'downloads',lambda n,s:self.progress.emit(n)); self.done.emit(p); return
+            src=self.payload; folder=make_project(src); self.message.emit('Project: '+str(folder)); self.progress.emit(5)
+            wav=folder/'source.wav'; self.message.emit('1/4 Tách âm thanh...'); extract_audio(src,wav); self.progress.emit(15)
+            self.message.emit('2/4 Whisper nhận dạng tiếng Trung (lần đầu sẽ tải model)...')
+            seg=transcribe_whisper(wav,model_name='large-v3'); save_segments(seg,folder/'zh.json'); self.progress.emit(48)
+            if not ollama_available():
+                write_srt(seg,folder/'zh.srt',text_key='text'); self.done.emit('NEED_OLLAMA|'+str(folder)); return
+            self.message.emit('3/4 Dịch Trung → Việt bằng AI local...'); seg=translate_segments(seg,progress=lambda n:self.progress.emit(48+int(n*.32))); save_segments(seg,folder/'vi.json')
+            srt=write_srt(seg,folder/'vi.srt'); self.progress.emit(82)
+            self.message.emit('4/4 Render phụ đề Việt bằng NVENC...'); out=BASE/'output'/(Path(src).stem+'_VI.mp4'); render_subtitles(src,srt,out); self.progress.emit(100); self.done.emit(str(out))
+        except Exception as e: self.failed.emit(str(e)+'\n'+traceback.format_exc()[-2500:])
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle(f'{APP_NAME} v{VERSION}'); self.resize(1180,760)
-        root=QWidget(); self.setCentralWidget(root); layout=QVBoxLayout(root)
-        title=QLabel('VIDEO STUDIO PERSONAL'); title.setStyleSheet('font-size:28px;font-weight:700;padding:10px')
-        layout.addWidget(title); layout.addWidget(QLabel('V0.2 • kiểm tra video • project • hệ thống GPU/NVENC • local-first'))
-        row=QHBoxLayout(); add=QPushButton('+ Thêm video'); add.clicked.connect(self.add_video); remove=QPushButton('− Xóa'); remove.clicked.connect(self.remove_video); check=QPushButton('⚙ Kiểm tra hệ thống'); check.clicked.connect(self.system_check); start=QPushButton('▶ Tạo project'); start.clicked.connect(self.create_project)
-        for b in (add,remove,check,start): row.addWidget(b)
-        layout.addLayout(row)
-        self.queue=QTreeWidget(); self.queue.setHeaderLabels(['Video','Thời lượng','Độ phân giải','FPS','Codec','Trạng thái']); self.queue.header().setSectionResizeMode(0,QHeaderView.Stretch); layout.addWidget(self.queue)
-        self.progress=QProgressBar(); layout.addWidget(self.progress)
-        box=QGroupBox('Logs Console'); bl=QVBoxLayout(box); self.logs=QTextEdit(); self.logs.setReadOnly(True); self.logs.setMaximumHeight(190); bl.addWidget(self.logs); layout.addWidget(box)
-        self.status=QLabel(f'Dữ liệu riêng: {BASE}'); layout.addWidget(self.status); self.log('V0.2 đã khởi động.')
-    def log(self,text):
-        line=f'[{datetime.now():%H:%M:%S}] {text}'; self.logs.append(line); logging.info(text)
+        super().__init__(); self.worker=None; self.setWindowTitle(f'{APP_NAME} v{VERSION}'); self.resize(1220,800)
+        root=QWidget(); self.setCentralWidget(root); L=QVBoxLayout(root)
+        t=QLabel('VIDEO STUDIO PERSONAL'); t.setStyleSheet('font-size:28px;font-weight:700;padding:8px'); L.addWidget(t)
+        L.addWidget(QLabel('V0.4 • Douyin/local • Whisper tiếng Trung • dịch local • phụ đề Việt • NVENC'))
+        urlrow=QHBoxLayout(); self.url=QLineEdit(); self.url.setPlaceholderText('Dán link video Douyin / nguồn được yt-dlp hỗ trợ...'); dl=QPushButton('⬇ Tải video'); dl.clicked.connect(self.download); urlrow.addWidget(self.url); urlrow.addWidget(dl); L.addLayout(urlrow)
+        row=QHBoxLayout();
+        for text,fn in [('+ Thêm video',self.add_video),('− Xóa',self.remove_video),('⚙ Kiểm tra hệ thống',self.system_check),('▶ Xử lý Trung → Việt',self.process)]:
+            b=QPushButton(text); b.clicked.connect(fn); row.addWidget(b)
+        L.addLayout(row)
+        settings=QHBoxLayout(); settings.addWidget(QLabel('Model dịch local:')); self.model=QComboBox(); self.model.addItems(['qwen2.5:7b']); settings.addWidget(self.model); settings.addWidget(QLabel('Âm lượng gốc:')); self.vol=QDoubleSpinBox(); self.vol.setRange(0,1); self.vol.setSingleStep(.05); self.vol.setValue(.65); settings.addWidget(self.vol); settings.addStretch(); L.addLayout(settings)
+        self.queue=QTreeWidget(); self.queue.setHeaderLabels(['Video','Thời lượng','Độ phân giải','FPS','Codec','Trạng thái']); self.queue.header().setSectionResizeMode(0,QHeaderView.Stretch); L.addWidget(self.queue)
+        self.progress=QProgressBar(); L.addWidget(self.progress)
+        box=QGroupBox('Logs Console'); bl=QVBoxLayout(box); self.logs=QTextEdit(); self.logs.setReadOnly(True); self.logs.setMaximumHeight(210); bl.addWidget(self.logs); L.addWidget(box)
+        self.status=QLabel('Dữ liệu: '+str(BASE)); L.addWidget(self.status); self.log('Ứng dụng đã khởi động.')
+    def log(self,s): self.logs.append(f'[{datetime.now():%H:%M:%S}] {s}'); logging.info(s)
+    def add_path(self,f):
+        if self.queue.topLevelItemCount()>=3:return
+        info=probe(f); name=Path(f).name
+        if 'error' in info: vals=[name,'—','—','—','—','Lỗi đọc video']; self.log(info['error'])
+        else: vals=[name,dt(info['duration']),info['resolution'],str(info['fps']),info['video_codec'],'Sẵn sàng']
+        it=QTreeWidgetItem(vals); it.setData(0,Qt.UserRole,f); self.queue.addTopLevelItem(it)
     def add_video(self):
-        if self.queue.topLevelItemCount()>=3: QMessageBox.information(self,APP_NAME,'Hàng đợi tối đa 3 video.'); return
         files,_=QFileDialog.getOpenFileNames(self,'Chọn video',str(Path.home()),'Video (*.mp4 *.mkv *.mov *.avi *.webm *.m4v)')
         for f in files:
-            if self.queue.topLevelItemCount()>=3: break
-            if any(self.queue.topLevelItem(i).data(0,Qt.UserRole)==f for i in range(self.queue.topLevelItemCount())): continue
-            info=probe(f); name=Path(f).name
-            if 'error' in info:
-                item=QTreeWidgetItem([name,'—','—','—','—','Cần FFmpeg']); self.log(f'{name}: {info["error"]}')
-            else:
-                item=QTreeWidgetItem([name,duration_text(info['duration']),info['resolution'],str(info['fps']),info['codec'],'Sẵn sàng']); self.log(f"Đã đọc {name}: {info['resolution']} | {duration_text(info['duration'])} | {info['fps']} fps")
-            item.setData(0,Qt.UserRole,f); self.queue.addTopLevelItem(item)
+            if self.queue.topLevelItemCount()>=3:break
+            self.add_path(f)
     def remove_video(self):
-        for item in self.queue.selectedItems(): self.queue.takeTopLevelItem(self.queue.indexOfTopLevelItem(item))
+        for x in self.queue.selectedItems():self.queue.takeTopLevelItem(self.queue.indexOfTopLevelItem(x))
+    def start_worker(self,mode,payload):
+        if self.worker and self.worker.isRunning(): QMessageBox.information(self,APP_NAME,'Đang có tác vụ chạy.'); return
+        self.progress.setValue(0); self.worker=Worker(mode,payload); self.worker.message.connect(self.log); self.worker.progress.connect(self.progress.setValue); self.worker.failed.connect(self.fail); self.worker.done.connect(self.finish); self.worker.start()
+    def download(self):
+        u=self.url.text().strip()
+        if not u:return
+        self.log('Bắt đầu tải video...'); self.start_worker('download',u)
+    def process(self):
+        items=self.queue.selectedItems(); it=items[0] if items else (self.queue.topLevelItem(0) if self.queue.topLevelItemCount() else None)
+        if not it: QMessageBox.information(self,APP_NAME,'Hãy thêm video trước.'); return
+        self.start_worker('process',it.data(0,Qt.UserRole))
+    def finish(self,result):
+        if result.startswith('NEED_OLLAMA|'):
+            folder=result.split('|',1)[1]; self.log('Whisper đã xong. Chưa có dịch local vì Ollama chưa chạy.'); QMessageBox.warning(self,APP_NAME,'Đã nhận dạng tiếng Trung nhưng chưa phát hiện bộ dịch local Ollama.\nProject: '+folder); return
+        if Path(result).suffix.lower() in ('.mp4','.mkv','.mov','.webm') and Path(result).parent==BASE/'downloads': self.add_path(result); self.log('Tải xong: '+result)
+        else:self.log('Hoàn tất: '+result)
+        QMessageBox.information(self,APP_NAME,'Hoàn tất:\n'+result)
+    def fail(self,e): self.log('LỖI: '+e); QMessageBox.critical(self,APP_NAME,e[-1800:])
     def system_check(self):
-        self.log('--- Kiểm tra hệ thống ---'); ff=find_tool('ffmpeg'); fp=find_tool('ffprobe')
-        self.log('FFmpeg: '+('✓ '+ff if ff else '✕ chưa tìm thấy')); self.log('ffprobe: '+('✓ '+fp if fp else '✕ chưa tìm thấy'))
-        nv=shutil.which('nvidia-smi')
+        ff=bundled('ffmpeg'); fp=bundled('ffprobe'); self.log('FFmpeg: '+('✓' if ff else '✕')); self.log('ffprobe: '+('✓' if fp else '✕'))
+        import shutil; nv=shutil.which('nvidia-smi')
         if nv:
-            rc,out,err=run([nv,'--query-gpu=name,driver_version,memory.total','--format=csv,noheader'],10); self.log('NVIDIA: '+(('✓ '+out) if rc==0 else '✕ '+err))
-        else: self.log('NVIDIA: ✕ không tìm thấy nvidia-smi')
+            rc,out,err=run([nv,'--query-gpu=name,driver_version,memory.total','--format=csv,noheader'],10); self.log('NVIDIA: '+(out if rc==0 else err))
         if ff:
-            rc,out,err=run([ff,'-hide_banner','-encoders'],15); self.log('NVENC: '+('✓ h264_nvenc sẵn sàng' if 'h264_nvenc' in out+err else '✕ chưa phát hiện h264_nvenc'))
-        self.log('Thư mục output: '+str(BASE/'output')); self.log('--- Hoàn tất ---')
-    def create_project(self):
-        n=self.queue.topLevelItemCount()
-        if not n: QMessageBox.information(self,APP_NAME,'Hãy thêm ít nhất 1 video.'); return
-        stamp=datetime.now().strftime('%Y%m%d-%H%M%S'); folder=BASE/'projects'/stamp; folder.mkdir(parents=True,exist_ok=True)
-        videos=[]
-        for i in range(n):
-            it=self.queue.topLevelItem(i); videos.append({'source':it.data(0,Qt.UserRole),'duration':it.text(1),'resolution':it.text(2),'fps':it.text(3),'codec':it.text(4)})
-        (folder/'project.json').write_text(json.dumps({'version':VERSION,'created':datetime.now().isoformat(),'videos':videos},ensure_ascii=False,indent=2),encoding='utf-8')
-        self.progress.setValue(100); self.log(f'Đã tạo project: {folder}'); QMessageBox.information(self,APP_NAME,f'Đã tạo project V0.2\n{folder}\n\nBước AI/render sẽ được ghép ở bản tiếp theo.')
+            rc,out,err=run([ff,'-hide_banner','-encoders'],15); self.log('NVENC: '+('✓' if 'h264_nvenc' in out+err else '✕'))
+        self.log('Ollama dịch local: '+('✓' if ollama_available() else '✕ chưa chạy/cài'))
 
 if __name__=='__main__':
     app=QApplication(sys.argv); app.setStyle('Fusion'); w=MainWindow(); w.show(); sys.exit(app.exec())
