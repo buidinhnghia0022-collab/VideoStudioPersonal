@@ -17,32 +17,40 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
-      - name: Install dependencies
+
+      - name: Install Python dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller==6.16.0
-          choco install ffmpeg-shared --no-progress -y
           choco install innosetup --no-progress -y
-      - name: Locate FFmpeg
-        id: media
+
+      - name: Download FFmpeg essentials
         shell: pwsh
         run: |
-          $ffmpeg=(Get-Command ffmpeg.exe).Source
-          $ffprobe=(Get-Command ffprobe.exe).Source
-          "ffmpeg=$ffmpeg" >> $env:GITHUB_OUTPUT
-          "ffprobe=$ffprobe" >> $env:GITHUB_OUTPUT
+          Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile 'ffmpeg.zip'
+          Expand-Archive -Path 'ffmpeg.zip' -DestinationPath 'ffmpeg-build' -Force
+          $ffmpeg = Get-ChildItem -Path 'ffmpeg-build' -Recurse -Filter 'ffmpeg.exe' | Select-Object -First 1
+          $ffprobe = Get-ChildItem -Path 'ffmpeg-build' -Recurse -Filter 'ffprobe.exe' | Select-Object -First 1
+          if (!$ffmpeg -or !$ffprobe) { throw 'FFmpeg binaries not found after extraction' }
+          New-Item -ItemType Directory -Force -Path 'tools\ffmpeg' | Out-Null
+          Copy-Item $ffmpeg.FullName 'tools\ffmpeg\ffmpeg.exe'
+          Copy-Item $ffprobe.FullName 'tools\ffmpeg\ffprobe.exe'
+          & 'tools\ffmpeg\ffmpeg.exe' -version
+
       - name: Build application
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --windowed --name VideoStudioPersonal --collect-all yt_dlp --collect-all faster_whisper --collect-all ctranslate2 --add-binary "${{ steps.media.outputs.ffmpeg }};." --add-binary "${{ steps.media.outputs.ffprobe }};." app.py
+          pyinstaller --noconfirm --clean --windowed --name VideoStudioPersonal --collect-all yt_dlp --collect-all faster_whisper --collect-all ctranslate2 --add-binary 'tools\ffmpeg\ffmpeg.exe;tools\ffmpeg' --add-binary 'tools\ffmpeg\ffprobe.exe;tools\ffmpeg' app.py
           if (!(Test-Path 'dist/VideoStudioPersonal/VideoStudioPersonal.exe')) { throw 'EXE build failed' }
+
       - name: Build installer
         shell: pwsh
         run: |
           & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer.iss
           if (!(Test-Path 'installer/VideoStudioPersonal_Setup.exe')) { throw 'Installer build failed' }
+
       - uses: actions/upload-artifact@v4
         with:
           name: VideoStudioPersonal-Windows-Installer
