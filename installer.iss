@@ -1,6 +1,6 @@
 [Setup]
 AppName=Video Studio Personal
-AppVersion=0.2.0
+AppVersion=0.4.0
 DefaultDirName={localappdata}\VideoStudioPersonal
 DefaultGroupName=Video Studio Personal
 OutputDir=installer
@@ -11,6 +11,8 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName=Video Studio Personal
+CloseApplications=yes
+RestartApplications=no
 
 [Files]
 Source: "dist\VideoStudioPersonal\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
